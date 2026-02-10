@@ -4,22 +4,7 @@
  * @author      Dominik
  *
  * @description
- * This application runs on the STM32F446ZE microcontroller and periodically
- * measures temperature and humidity using a DHT22 digital sensor.
- *
- * The DHT22 uses a proprietary single-wire protocol that requires precise
- * microsecond timing. Timing is generated using an STM32 general-purpose
- * timer configured as a free-running microsecond counter (TIM9).
- *
- * A second timer (TIM6) generates a periodic interrupt every 5 seconds to
- * trigger a new measurement. After each successful read, the decoded values
- * are transmitted to a PC over USART3 via the ST-Link Virtual COM port.
- *
- * Program flow:
- *   - TIM6 interrupt sets a measurement flag
- *   - main loop calls the DHT22 driver
- *   - driver performs protocol timing using TIM9
- *   - results are validated (checksum) and printed via UART
+ * TODO
  *
  ******************************************************************************/
 
@@ -42,8 +27,7 @@
  *   Periodic 5 s interrupt used to schedule sensor measurements.
  *
  * TIM9
- *   Free-running 1 MHz counter (1 µs resolution) used for precise timing
- *   of the DHT22 protocol.
+ *   TODO
  ******************************************************************************
  */
 
@@ -91,8 +75,8 @@
 
 /* --- GLOBAL VARIABLES --- */
 static void uart_send_str(const char *s);
-volatile bool dht22_read_flag = false;
-volatile uint8_t error_bit;
+volatile bool dht22_req_flag = false;
+volatile bool dht22_done_flag = false;
 
 /* --- FUNCTION PROTOTYPES --- */
 
@@ -121,7 +105,7 @@ void USART3_init(void);
 void TIM6_init(void);
 
 /**
- * @brief  Initializes TIM9 as a free-running microsecond timer.
+ * @brief  Initializes TIM9 in input capture mode.
  * @note   Used for DHT22 protocol timing.
  */
 void TIM9_init(void);
@@ -134,7 +118,7 @@ void TIM6_DAC_IRQHandler(void);
 
 /**
  * @brief  TIM1 Break and TIM9 global interrupt handler.
- * @note   Currently not used.
+ * @note   TODO.
  */
 void TIM1_BRK_TIM9_IRQHandler(void);
 
@@ -152,22 +136,32 @@ int main(void)
 	USART3_init();
 	TIM6_init();
 	TIM9_init();
+	dht22_init();
 
-	// start periodic timer -> counter enable
+	// Start periodic timer
 	TIM6->CR1 |= TIM_CR1_CEN;
 
 	uart_send_str("================================\r\n");
 	uart_send_str("DHT22\r\n");
 	uart_send_str("================================\r\n");
-	/* Loop forever */
+
 	for (;;)
 	{
-		if (dht22_read_flag)
+		if (dht22_req_flag)
 		{
-			dht22_read_flag = false;
+			dht22_req_flag = false;
+			// Send start pulse to DHT22
+			if (dht22_start_read() == DHT22_START_OK)
+			{
+				// Measurement started, wait for completion in main loop
+			}
+		}
 
+		if (dht22_done_flag)
+		{
+			dht22_done_flag = false;
 			float temperature = 0.0f, humidity = 0.0f;
-			dht22_status_t status = dht22_read(&temperature, &humidity);
+			dht22_status_t status = dht22_get_result(&temperature, &humidity);
 
 			char msg[64];
 			if (status == DHT22_OK)
@@ -189,71 +183,48 @@ int main(void)
 
 void Clock_Init(void)
 {
-// Enable clock for GPIOE on AHB1
+	// Enable clocks for GPIOE, GPIOB, GPIOD, TIM6, TIM9, USART3
 	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOEEN;
-
-	// Enable clock for TIM6 on APB1
 	RCC->APB1ENR |= RCC_APB1ENR_TIM6EN;
-
-	// Enable clock for TIM9 on APB2
 	RCC->APB2ENR |= RCC_APB2ENR_TIM9EN;
-
-	// enable USART3 clock on APB1
 	RCC->APB1ENR |= RCC_APB1ENR_USART3EN;
-
-	// Enable clock for GPIOB on AHB1
 	RCC->AHB1ENR |= RCC_AHB1ENR_GPIOBEN;
-
-	// Enable clock for GPIOD on AHB1 (needed for USART3 pins PD8/PD9)
 	RCC->AHB1ENR |= RCC_AHB1ENR_GPIODEN;
 }
+
 void GPIO_init(void)
 {
-// set PE5 as output with Pull-up resistor
+	// PE5: DHT22 data line as output with pull-up
 	GPIOE->MODER &= ~(GPIO_MODER_MODE5_Msk);
 	GPIOE->MODER |= (GPIO_MODER_MODE5_0);
 	GPIOE->PUPDR &= ~(GPIO_PUPDR_PUPD5_Msk);
 	GPIOE->PUPDR |= (GPIO_PUPDR_PUPD5_0);
 
-//	// set PE5 as AF3 --> TIM9_CH1
-//	GPIOE->MODER &= ~(GPIO_MODER_MODE5_Msk);
-//	GPIOE->MODER |= (GPIO_MODER_MODE5_1);
-//	GPIOE->AFR[0] &= ~(GPIO_AFRL_AFRL5);
-//	GPIOE->AFR[0] |= (0x3UL << GPIO_AFRL_AFSEL5_Pos);
+	// PB0, PB7, PB14: Onboard LEDs as output
+	GPIOB->MODER &= ~(GPIO_MODER_MODE0 | GPIO_MODER_MODE7 | GPIO_MODER_MODE14);
+	GPIOB->MODER |= (GPIO_MODER_MODE0_0 | GPIO_MODER_MODE7_0 | GPIO_MODER_MODE14_0);
 
-// Set integrated LEDs as output
-	GPIOB->MODER &= ~(GPIO_MODER_MODE0 | GPIO_MODER_MODE7 | GPIO_MODER_MODE14);	// clear bits
-	GPIOB->MODER |= (GPIO_MODER_MODE0_0 | GPIO_MODER_MODE7_0 | GPIO_MODER_MODE14_0);// 01: General purpose output mode
-
-// Ensure LEDs are off initially
+	// Ensure LEDs are off initially
 	GPIOB->ODR &= ~(GPIO_ODR_OD0 | GPIO_ODR_OD7 | GPIO_ODR_OD14);
 }
+
 void USART3_init(void)
 {
-// Set PD8 & PD9 as AF pins (10: Alternate function mode)
-	GPIOD->MODER &= ~(GPIO_MODER_MODE8 | GPIO_MODER_MODE9); // clear bits
-	GPIOD->MODER |= (GPIO_MODER_MODE8_1 | GPIO_MODER_MODE9_1); 	// PD8/PD9 -> AF
-// configure AF7 (USART3) for PD8 (AFRH nibble 0) and PD9 (AFRH nibble 1)
-	GPIOD->AFR[1] &= ~(GPIO_AFRH_AFRH0 | GPIO_AFRH_AFRH1);		// clear bits
+	// PD8 & PD9 as AF7 (USART3)
+	GPIOD->MODER &= ~(GPIO_MODER_MODE8 | GPIO_MODER_MODE9);
+	GPIOD->MODER |= (GPIO_MODER_MODE8_1 | GPIO_MODER_MODE9_1);
+	GPIOD->AFR[1] &= ~(GPIO_AFRH_AFRH0 | GPIO_AFRH_AFRH1);
 	GPIOD->AFR[1] |= (0x7UL << GPIO_AFRH_AFSEL8_Pos | 0x7UL << GPIO_AFRH_AFSEL9_Pos);
 
-// baud: 115200	bps; for PCLK1=16MHz USARTDIV=8.6875
+	// Baud: 115200, PCLK1=16MHz, USARTDIV=8.6875
 	USART3->BRR = (0x8U << 4U) | 0xBU;
-
-// Oversampling mode
-	USART3->CR1 &= ~USART_CR1_OVER8;	// 0: oversampling by 16
-// enable USART
-	USART3->CR1 |= USART_CR1_UE;		// 1: USART enabled
-// word length
-	USART3->CR1 &= ~USART_CR1_M;		// 0: 1 Start bit, 8 Data bits, n Stop bit
-// Parity control
-	USART3->CR1 &= ~USART_CR1_PCE;		// 0: Parity control disabled
-// STOP bits
-	USART3->CR2 &= ~USART_CR2_STOP;		// 00: 1 Stop bit
-// Transmitter enable
-	USART3->CR1 |= USART_CR1_TE;		// 1: Transmitter is enabled
-// Enable USART3 RX (for completeness, even if not used)
-	USART3->CR1 |= USART_CR1_RE; // 1: Receiver is enabled
+	USART3->CR1 &= ~USART_CR1_OVER8; // Oversampling by 16
+	USART3->CR1 |= USART_CR1_UE;     // USART enable
+	USART3->CR1 &= ~USART_CR1_M;     // 8 data bits
+	USART3->CR1 &= ~USART_CR1_PCE;   // Parity disabled
+	USART3->CR2 &= ~USART_CR2_STOP;  // 1 stop bit
+	USART3->CR1 |= USART_CR1_TE;     // Transmitter enable
+	USART3->CR1 |= USART_CR1_RE;     // Receiver enable
 
 	// If not using interrupts for RX/TX, do not enable IRQ
 	// NVIC_EnableIRQ(USART3_IRQn);
@@ -279,48 +250,66 @@ void TIM6_init(void)
 
 void TIM9_init(void)
 {
-	// get APB2 clock speed
 	uint32_t pclk2 = get_pclk2_hz();
-
-	// get timer clock speed
 	uint32_t tim9_clk = get_timxclk_from_pclk(pclk2);
-
-	// Prescaler value
+	//Prescaler value
 	TIM9->PSC = (tim9_clk / 1000000) - 1;	// get TIM counter clock at 1 MHz -> 1 µs period
-
-	// set large ARR
+	/* ARR */
 	TIM9->ARR = 0xFFFF;
+	// Input capture mode: CC1 as input, mapped to TI1
+	TIM9->CCMR1 &= ~TIM_CCMR1_CC1S;
+	TIM9->CCMR1 |= TIM_CCMR1_CC1S_0;
 
-	// enable counter
+	/* Input Capture polarity config:
+	 * 	// CC1P: Capture/Compare 1 output Polarity.
+	 * 	// CC1NP: Capture/Compare 1 complementary output Polarity
+	 * CC1NP:CC1P | Edge   | Note
+	 * -----------|--------|--------------------------------------------------
+	 *   0  :  0  | Rising | Standard
+	 *   0  :  1  | Falling| Standard
+	 *   1  :  1  | Both   | AVOID: Ambiguous timing/type, inconsistent HW support
+	 *
+	 * PRO TIP: For protocol decoding, manually toggle polarity in the ISR
+	 * instead of using "Both Edges" to maintain state machine clarity. */
+
+	// Set polarity to falling edge
+	TIM9->CCER &= ~(TIM_CCER_CC1NP | TIM_CCER_CC1P);
+	TIM9->CCER |= TIM_CCER_CC1P;
+
+	// Clear flags and enable interrupt
+	TIM9->SR = 0;
+	TIM9->DIER |= TIM_DIER_CC1IE;
+
+	// enable NVIC
+	NVIC_EnableIRQ(TIM1_BRK_TIM9_IRQn);
+
+	// Enable counter
 	TIM9->CR1 |= TIM_CR1_CEN;
 }
 
-// TIM6 global interrupt, DAC1 and DAC2 underrun error interrupt
+// TIM6 global interrupt: triggers DHT22 measurement and toggles LED
 void TIM6_DAC_IRQHandler(void)
 {
-// set flag
-	dht22_read_flag = true;
+	dht22_req_flag = true;
 
 // toggle integrated LED LD1 (green)
 	GPIOB->ODR ^= GPIO_ODR_OD0;
-
-// clear Update interrupt flag
-	TIM6->SR &= ~(TIM_SR_UIF);
+	TIM6->SR &= ~(TIM_SR_UIF); // Clear interrupt flag
 }
 
-// TIM1 Break interrupt and TIM9 global interrupt
-//void TIM1_BRK_TIM9_IRQHandler(void)
-//{
-//
-//}
+// TIM1 Break and TIM9 global interrupt: handles DHT22 protocol timing
+void TIM1_BRK_TIM9_IRQHandler(void)
+{
+	dht22_tim9_isr();
+}
 
-// USART3 global interrupt
-//void USART3_IRQHandler(void)
-//{
-//
-//}
+// USART3 global interrupt (not used)
+void USART3_IRQHandler(void)
+{
+	// No USART3 RX/TX interrupt logic implemented.
+}
 
-// Blocking transmit helper
+// Blocking transmit helper for UART
 static void uart_send_str(const char *s)
 {
 	if (!s)
@@ -329,9 +318,9 @@ static void uart_send_str(const char *s)
 	{
 		// Wait for TXE (polling, blocking)
 		while (!(USART3->SR & USART_SR_TXE));
-		USART3->DR = (uint8_t) (*s++);
+		USART3->DR = (uint8_t)(*s++);
 	}
-	// Wait for TC (optional, ensures all data sent)
+// Wait for TC (optional, ensures all data sent)
 	while (!(USART3->SR & USART_SR_TC));
 }
 

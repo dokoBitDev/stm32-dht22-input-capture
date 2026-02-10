@@ -44,43 +44,25 @@
 #include "stm32f446xx.h"
 #include "dht22.h"
 
+/* --- ISR State Machine States --- */
+typedef enum
+{
+	IDLE = 0,
+	WAIT_RESPONSE_LOW,
+	WAIT_RESPONSE_HIGH,
+	READ_BITS,
+	ERROR
+} dht22_isr_state_t;
+
 /* --- PRIVATE (STATIC) GLOBALS --- */
-static dht22_status_t status;
-extern uint8_t error_bit;
+static volatile dht22_status_t dht22_status;
+static volatile dht22_isr_state_t dht22_state = IDLE;
+static volatile uint64_t dht22_raw_data = 0;
+static uint16_t last_timestamp = 0;
+
+extern volatile bool dht22_done_flag;
 
 /* --- PRIVATE FUNCTION PROTOTYPES --- */
-/**
- * @brief  Sends the start signal to the DHT22 sensor.
- *
- * @param  none
- *
- * @return none
- *
- * @note   Pulls the data line low for at least 1ms, then releases it.
- */
-static void dht22_start(void);
-
-/**
- * @brief  Waits for the DHT22 sensor's response after the start signal.
- *
- * @param  none
- *
- * @return dht22_status_t  Status code (OK or error).
- *
- * @note   Waits for the sensor to pull the line low and then high, with timeout.
- */
-static dht22_status_t dht22_wait_for_response(void);
-
-/**
- * @brief  Reads the raw 5-byte data frame from the DHT22 sensor.
- *
- * @param  frame  Output buffer for 5 bytes of sensor data.
- *
- * @return dht22_status_t  Status code (OK or error).
- *
- * @note   Reads 40 bits (humidity, temperature, checksum) from the sensor.
- */
-static dht22_status_t dht22_read_raw(uint8_t frame[5]);
 
 /**
  * @brief  Validates the checksum of the received data frame.
@@ -107,252 +89,246 @@ static bool dht22_validate_checksum(const uint8_t frame[5]);
 static void dht22_decode(const uint8_t frame[5], float *temperature, float *humidity);
 
 /**
- * @brief  Configures PE5 as output with pull-up for DHT22 communication.
+ * @brief  Configures PE5 as output with pull-up for DHT22 communication
  *
  * @param  none
  *
  * @return none
  *
- * @note   Used to drive the data line low during start signal.
+ * @note   Used to drive the data line low during start signal
  */
 static void dht22_set_pin_output(void);
 
 /**
- * @brief  Configures PE5 as input with pull-up for DHT22 communication.
+ * @brief  Configures PE5 as Alternate Function (AF3)
  *
  * @param  none
  *
  * @return none
  *
- * @note   Used to release the data line and allow sensor to drive it.
+ * @note   TODO: Used to configure the TIM9_CH1 as input capture on AF3 on PE5
  */
-static void dht22_set_pin_input(void);
+static void dht22_set_pin_AF3(void);
 
 /* --- PUBLIC FUNCTION DEFINITIONS --- */
-
-/**
- * @brief  Reads DHT22 sensor data (temperature & humidity).
- *
- * @param  temperature  Pointer to store the measured temperature (°C).
- * @param  humidity     Pointer to store the measured humidity (%RH).
- *
- * @return dht22_status_t   Status code indicating result of the operation.
- *
- * @note   Initiates a read sequence and decodes the result if successful.
- */
-dht22_status_t dht22_read(float *temperature, float *humidity)
+void dht22_init(void)
 {
-	// validate pointers
-	if (temperature == NULL || humidity == NULL)
+	// No initialization required for now
+	dht22_state = IDLE;
+	dht22_status = DHT22_OK;
+	dht22_raw_data = 0;
+	last_timestamp = 0;
+	dht22_done_flag = false;
+}
+
+dht22_start_status_t dht22_start_read(void)
+{
+	if (dht22_state != IDLE)
+		return DHT22_START_BUSY;
+
+	dht22_raw_data = 0;
+	dht22_status = DHT22_OK;
+	dht22_done_flag = false;
+	dht22_state = WAIT_RESPONSE_LOW;
+
+	// Generate DHT22 start pulse (~1 ms LOW)
+	dht22_set_pin_output();
+	GPIOE->ODR &= ~GPIO_ODR_ODR_5;
+	uint16_t start_cnt = TIM9->CNT;
+	while ((TIM9->CNT - start_cnt) < DHT22_START_PERIOD_US);
+
+	// Release bus (HIGH) before switching to alternate function
+	GPIOE->ODR |= GPIO_ODR_ODR_5;
+	dht22_set_pin_AF3();
+
+	// Configure TIM9 polarity (capture first falling edge)
+	TIM9->CCER &= ~(TIM_CCER_CC1P | TIM_CCER_CC1NP);
+	TIM9->CCER |= TIM_CCER_CC1P;
+
+	TIM9->CNT = 0;
+	TIM9->SR = 0;
+	last_timestamp = 0;
+
+	// Enable CC1 capture
+	TIM9->CCER |= TIM_CCER_CC1E;
+
+	return DHT22_START_OK;
+}
+
+void dht22_tim9_isr(void)
+{
+	static uint64_t raw_frame = 0;
+	static uint8_t bit_no = 0;
+	static bool skip_first_edge = false; // NEW: flag to skip dummy edge
+
+	/* Only handle CC1 capture events */
+	if (!(TIM9->SR & TIM_SR_CC1IF))
+		return;
+
+	TIM9->SR &= ~TIM_SR_CC1IF; // Clear flag to avoid re-triggering
+
+	uint16_t timestamp = TIM9->CCR1;
+	uint16_t pulse_width = timestamp - last_timestamp;
+	last_timestamp = timestamp;
+
+	bool falling = (TIM9->CCER & TIM_CCER_CC1P);
+
+	switch (dht22_state)
+	{
+	case IDLE:
+		TIM9->CCER &= ~TIM_CCER_CC1E;
+		break;
+
+	case WAIT_RESPONSE_LOW:
+		if (!falling)
+		{
+			dht22_status = DHT22_ERR_NO_RESPONSE;
+			dht22_state = ERROR;
+			break;
+		}
+		dht22_state = WAIT_RESPONSE_HIGH;
+		break;
+
+	case WAIT_RESPONSE_HIGH:
+		if (falling)
+		{
+			dht22_status = DHT22_ERR_TIMEOUT;
+			dht22_state = ERROR;
+			break;
+		}
+		// validate RESPONSE_LOW pulse
+		if (pulse_width < DHT22_RESPONSE_LOW_TIME_MIN || pulse_width > DHT22_RESPONSE_LOW_TIME_MAX)
+		{
+			dht22_status = DHT22_ERR_TIMEOUT;
+			dht22_state = ERROR;
+			break;
+		}
+		raw_frame = 0;
+		bit_no = 0;
+		skip_first_edge = true; // NEW: skip the first edge in READ_BITS
+		dht22_state = READ_BITS;
+		break;
+
+	case READ_BITS:
+		// The first edge after entering READ_BITS is the end of the response high pulse (dummy edge)
+		if (skip_first_edge)
+		{
+			skip_first_edge = false;
+			break; // Ignore this edge, do not process as data bit
+		}
+		// rising edge
+		if (!falling)
+		{
+			/* rising edge → LOW period */
+			if (pulse_width < DHT22_SIGNAL_LOW_TIME_MIN || pulse_width > DHT22_SIGNAL_LOW_TIME_MAX)
+			{
+				dht22_status = DHT22_ERR_TIMEOUT;
+				dht22_state = ERROR;
+			}
+			break;
+		}
+		// Only process if we have not yet collected 40 bits
+		if (bit_no < 40)
+		{
+			if (pulse_width > DHT22_BIT_THRESHOLD)
+				raw_frame |= (1ULL << (39 - bit_no));
+			bit_no++;
+		}
+
+		if (bit_no == 40)
+		{
+			TIM9->CCER &= ~TIM_CCER_CC1E;	// disable CC1 capture
+			dht22_raw_data = raw_frame; 	// global result
+			dht22_status = DHT22_OK;
+			dht22_done_flag = true;
+			dht22_state = IDLE;
+			return;
+		}
+		break;
+
+	case ERROR:
+		// disable CC1 capture
+		TIM9->CCER &= ~TIM_CCER_CC1E;
+		dht22_done_flag = true;
+		dht22_state = IDLE;
+		return;
+	}
+	// Toggle edge polarity for next capture
+	TIM9->CCER ^= TIM_CCER_CC1P;
+}
+
+dht22_status_t dht22_get_result(float *temperature, float *humidity)
+{
+	if (!temperature || !humidity)
 		return DHT22_ERR_PARAM;
 
 	uint8_t frame[5];
-	dht22_start();
-	status = dht22_wait_for_response();
-	if (status != DHT22_OK)
-		return status;
-	status = dht22_read_raw(frame);
-	if (status != DHT22_OK)
-			return status;
+	frame[0] = (dht22_raw_data >> 32) & 0xFF;
+	frame[1] = (dht22_raw_data >> 24) & 0xFF;
+	frame[2] = (dht22_raw_data >> 16) & 0xFF;
+	frame[3] = (dht22_raw_data >> 8) & 0xFF;
+	frame[4] = (dht22_raw_data) & 0xFF;
+
 	if (!dht22_validate_checksum(frame))
 		return DHT22_ERR_CHECKSUM;
 	dht22_decode(frame, temperature, humidity);
 	return DHT22_OK;
 }
 
-/**
- * @brief  Converts a DHT22 status code to a human-readable string.
- *
- * @param  status  Status code to convert.
- *
- * @return const char*  Pointer to a static string describing the status.
- *
- * @note   Useful for UART logging or debugging.
- */
-const char* dht22_status_to_str(dht22_status_t status) {
-    switch (status) {
-        case DHT22_OK:               return "DHT22: OK\r\n";
-        case DHT22_ERR_NO_RESPONSE:  return "DHT22 ERROR: No response (Check wiring)\r\n";
-        case DHT22_ERR_TIMEOUT:      return "DHT22 ERROR: Communication timeout\r\n";
-        case DHT22_ERR_CHECKSUM:     return "DHT22 ERROR: Checksum mismatch (Bad data)\r\n";
-        case DHT22_ERR_PARAM:        return "DHT22 ERROR: Invalid parameters passed\r\n";
-        default:                     return "DHT22 ERROR: Unknown status\r\n";
-    }
+const char* dht22_status_to_str(dht22_status_t status)
+{
+	switch (status)
+	{
+	case DHT22_OK:
+		return "DHT22: OK\r\n";
+	case DHT22_ERR_NO_RESPONSE:
+		return "DHT22 ERROR: No response (Check wiring)\r\n";
+	case DHT22_ERR_TIMEOUT:
+		return "DHT22 ERROR: Communication timeout\r\n";
+	case DHT22_ERR_CHECKSUM:
+		return "DHT22 ERROR: Checksum mismatch (Bad data)\r\n";
+	case DHT22_ERR_PARAM:
+		return "DHT22 ERROR: Invalid parameters passed\r\n";
+	default:
+		return "DHT22 ERROR: Unknown status\r\n";
+	}
 }
 
 /* --- PRIVATE FUNCTION DEFINITIONS --- */
-static void dht22_start(void)
-{
-	// start pulse - set SDA low
-	dht22_set_pin_output();
-	GPIOE->ODR &= ~GPIO_ODR_ODR_5;
-
-	// wait 1000µs
-	uint16_t start_cnt = TIM9->CNT;
-	while (((TIM9->CNT - start_cnt) & 0xFFFF) < DHT22_START_PERIOD_US)
-		;
-
-	// release SDA - configure PE5 as input with Pull-up resistor
-	dht22_set_pin_input();
-}
-
-static dht22_status_t dht22_wait_for_response(void)
-{
-	uint16_t start_cnt = TIM9->CNT;
-	// Wait for the release of the bus with timeout
-	while (GPIOE->IDR & GPIO_IDR_IDR_5)
-	{
-		if (((TIM9->CNT - start_cnt) & 0xFFFF) > DHT22_RESPONSE_TIMEOUT)
-		{
-			// timeout reached
-			return DHT22_ERR_NO_RESPONSE;
-		}
-	}
-
-	// Wait for the sensor to respond with ~80 µs LOW state
-	start_cnt = TIM9->CNT;
-	while (!(GPIOE->IDR & GPIO_IDR_IDR_5))
-	{
-		if (((TIM9->CNT - start_cnt) & 0xFFFF) > DHT22_RESPONSE_TIMEOUT)
-		{
-			// timeout reached
-			return DHT22_ERR_NO_RESPONSE;
-		}
-	}
-//	uint16_t sensor_response_low = (TIM9->CNT - start_cnt) & 0xFFFF;
-
-	// Wait for the sensor to respond with ~80 µs HIGH state
-	start_cnt = TIM9->CNT;
-	while (GPIOE->IDR & GPIO_IDR_IDR_5)
-	{
-		if (((TIM9->CNT - start_cnt) & 0xFFFF) > DHT22_RESPONSE_TIMEOUT)
-		{
-			// timeout reached
-			return DHT22_ERR_NO_RESPONSE;
-		}
-	}
-
-//	uint16_t sensor_response_high = (TIM9->CNT - start_cnt) & 0xFFFF;
-
-	// validate response signal
-//	if (sensor_response_low > DHT22_RESPONSE_LOW_TIME_MIN
-//			&& sensor_response_low < DHT22_RESPONSE_LOW_TIME_MAX
-//			&& sensor_response_high > DHT22_RESPONSE_HIGH_TIME_MIN
-//			&& sensor_response_high < DHT22_RESPONSE_HIGH_TIME_MAX)
-//		return 1;
-//	else
-//		return 0;
-
-	return DHT22_OK;
-
-}
-
-static dht22_status_t dht22_read_raw(uint8_t frame[5])
-{
-	// validate pointer
-	if (frame == NULL)
-			return DHT22_ERR_PARAM;
-
-	uint64_t data_bits = 0;
-	uint16_t start_cnt;
-	uint16_t pulse_width;
-
-	for (uint8_t i = 0; i < 40; i++)
-	{
-		// 1. Wait for LOW (start of bit)
-		start_cnt = TIM9->CNT;
-		while (GPIOE->IDR & GPIO_IDR_IDR_5)
-		{
-			if ((uint16_t) (TIM9->CNT - start_cnt) > DHT22_SIGNAL_LOW_TIME_MAX)
-			{
-				error_bit = i;
-				return DHT22_ERR_TIMEOUT;
-			}
-		}
-		// Wait for HIGH (start of pulse)
-		start_cnt = TIM9->CNT;
-		while (!(GPIOE->IDR & GPIO_IDR_IDR_5))
-		{
-			if (((TIM9->CNT - start_cnt)) > DHT22_SIGNAL_LOW_TIME_MAX)
-			{
-				error_bit = i;
-				// timeout reached
-				return DHT22_ERR_TIMEOUT;
-
-			}
-		}
-		// Measure HIGH pulse width
-		start_cnt = TIM9->CNT;
-		while (GPIOE->IDR & GPIO_IDR_IDR_5)
-		{
-			// check if the time for the longest bit duration has passed (high state)
-			if (((TIM9->CNT - start_cnt)) > DHT22_SIGNAL_1_HIGH_TIME_MAX)
-			{
-				error_bit = i;
-				// timeout reached
-				return DHT22_ERR_TIMEOUT;
-
-			}
-		}
-
-		pulse_width = (uint16_t) (TIM9->CNT - start_cnt);
-		// Store bit (threshold ~50 µs)
-		if (pulse_width < DHT22_BIT_THRESHOLD)
-			data_bits &= ~(0x1ULL << (39 - i));
-		else
-			data_bits |= (0x1ULL << (39 - i));
-	}
-
-	frame[0] = (data_bits >> 32) & 0xFF;
-	frame[1] = (data_bits >> 24) & 0xFF;
-	frame[2] = (data_bits >> 16) & 0xFF;
-	frame[3] = (data_bits >> 8) & 0xFF;
-	frame[4] = (data_bits) & 0xFF;
-
-	return DHT22_OK;
-}
-
 static bool dht22_validate_checksum(const uint8_t frame[5])
 {
-	// validate pointer
-	if (frame == NULL)
-			return false;
-
-	// Verify checksum
-	if ((uint8_t) (frame[0] + frame[1] + frame[2] + frame[3]) != frame[4])
-	{
+	if (!frame)
 		return false;
-	}
+	if ((uint8_t) (frame[0] + frame[1] + frame[2] + frame[3]) != frame[4])
+		return false;
 	return true;
 }
 
 static void dht22_decode(const uint8_t frame[5], float *temperature, float *humidity)
 {
-	// validate pointers
 	if (!frame || !temperature || !humidity)
 		return;
 
 	*humidity = ((frame[0] << 8) | frame[1]) / 10.0f;
-	// Extract magnitude by masking the sign bit (0x7F = 0111 1111)
+// Extract magnitude by masking the sign bit (0x7F = 0111 1111)
 	*temperature = (((frame[2] & 0x7F) << 8) | frame[3]) / 10.0f;
-	// Apply negative sign if the 8th bit of frame[2] is set
-	if (frame[2] & 0x80) {
-	    *temperature *= -1.0f;
-	}
+// Apply negative sign if the 8th bit of frame[2] is set
+	if (frame[2] & 0x80)
+		*temperature *= -1.0f;
 }
 
 static void dht22_set_pin_output(void)
 {
-	// set PE5 as output with Pull-up resistor
 	GPIOE->MODER &= ~(GPIO_MODER_MODE5_Msk);
 	GPIOE->MODER |= (GPIO_MODER_MODE5_0);
 	GPIOE->PUPDR &= ~(GPIO_PUPDR_PUPD5_Msk);
 	GPIOE->PUPDR |= (GPIO_PUPDR_PUPD5_0);
 }
 
-static void dht22_set_pin_input(void)
+static void dht22_set_pin_AF3(void)
 {
 	GPIOE->MODER &= ~(GPIO_MODER_MODE5_Msk);
-	GPIOE->PUPDR &= ~(GPIO_PUPDR_PUPD5_Msk);
-	GPIOE->PUPDR |= (GPIO_PUPDR_PUPD5_0);
+	GPIOE->MODER |= (GPIO_MODER_MODE5_1);
+	GPIOE->AFR[0] &= ~(GPIO_AFRL_AFRL5);
+	GPIOE->AFR[0] |= (0x3UL << GPIO_AFRL_AFSEL5_Pos);
 }

@@ -2,15 +2,7 @@
  * @file        dht22.h
  * @brief       Public interface for DHT22 sensor driver
  * @author      Dominik
- *
- * Provides a simple, hardware-abstracted API for reading temperature and
- * humidity values from a DHT22 sensor.
- *
- * The implementation handles all protocol timing, decoding, and checksum
- * validation internally. The application only interacts with high-level
- * measurement functions and status codes.
  ******************************************************************************/
-
 
 #ifndef DHT22_H_
 #define DHT22_H_
@@ -20,23 +12,16 @@
 
 /* --- DEFINITIONS & MACROS --- */
 /* --- PUBLIC CONSTANTS --- */
-#define DHT22_START_PERIOD_US			1000	// [µs]
-#define DHT22_RESPONSE_TIMEOUT 			300		// [µs]
-#define DHT22_RESPONSE_LOW_TIME_MIN		75		// [µs]
-#define DHT22_RESPONSE_LOW_TIME_MAX		85		// [µs]
-#define DHT22_RESPONSE_HIGH_TIME_MIN	75		// [µs]
-#define DHT22_RESPONSE_HIGH_TIME_MAX	85		// [µs]
-#define DHT22_BIT_THRESHOLD 			50		// [µs]
-#define DHT22_SIGNAL_LOW_TIME			50		// [µs]
-#define DHT22_SIGNAL_LOW_TIME_MIN		48		// [µs]
-#define DHT22_SIGNAL_LOW_TIME_MAX		55 + 5	// [µs]; added tolerance
-#define DHT22_SIGNAL_0_HIGH_TIME		26		// [µs]
-#define DHT22_SIGNAL_0_HIGH_TIME_MIN	22		// [µs]
-#define DHT22_SIGNAL_0_HIGH_TIME_MAX	30		// [µs]
-#define DHT22_SIGNAL_1_HIGH_TIME		70		// [µs]
-#define DHT22_SIGNAL_1_HIGH_TIME_MIN	68		// [µs]
-#define DHT22_SIGNAL_1_HIGH_TIME_MAX	75 + 5	// [µs]; added tolerance
-#define DHT22_SENSOR_RELEASE_BUS		50		// [µs]
+// all in microseconds (µs)
+#define DHT_TIME_TOLERANCE				10
+#define DHT22_START_PERIOD_US			1000
+#define DHT22_RESPONSE_LOW_TIME_MIN		(75 - DHT_TIME_TOLERANCE)
+#define DHT22_RESPONSE_LOW_TIME_MAX		(85 + DHT_TIME_TOLERANCE)
+#define DHT22_RESPONSE_HIGH_TIME_MIN	(75 - DHT_TIME_TOLERANCE)
+#define DHT22_RESPONSE_HIGH_TIME_MAX	(85 + DHT_TIME_TOLERANCE)
+#define DHT22_BIT_THRESHOLD 			50
+#define DHT22_SIGNAL_LOW_TIME_MIN		(45 - DHT_TIME_TOLERANCE)
+#define DHT22_SIGNAL_LOW_TIME_MAX		(55 + DHT_TIME_TOLERANCE)
 
 /* --- PUBLIC TYPE DEFINITIONS --- */
 /**
@@ -51,26 +36,58 @@ typedef enum
 	DHT22_ERR_PARAM
 } dht22_status_t;
 
-/* --- PUBLIC FUNCTION PROTOTYPES --- */
 /**
- * @brief  Reads DHT22 sensor data (temperature & humidity).
- *
- * Initiates a read sequence with the DHT22 sensor and retrieves
- * temperature and humidity values if successful.
- *
- * @param[out] temperature  Pointer to store the measured temperature (°C).
- * @param[out] humidity     Pointer to store the measured humidity (%RH).
- * @return dht22_status_t   Status code indicating result of the operation.
+ * @brief status of the DHT22 start function
  */
-dht22_status_t dht22_read(float *temperature, float *humidity);
+typedef enum
+{
+	DHT22_START_OK = 0,
+	DHT22_START_BUSY
+} dht22_start_status_t;
+
+/* --- PUBLIC VARIABLES --- */
+/* --- PUBLIC FUNCTION PROTOTYPES --- */
 
 /**
- * @brief  Converts a DHT22 status code to a human-readable string.
+ * @brief  Initialize DHT22 driver state.
  *
- * Useful for UART logging or debugging.
+ * @param	none
+ * @return 	none
+ */
+void dht22_init(void);
+
+/**
+ * @brief  Start a DHT22 measurement (non-blocking).
  *
- * @param[in] status    Status code to convert.
- * @return const char*  Pointer to a static string describing the status.
+ *	set PE5 as GPIO output, generates a 1ms start signal on PE5, releases bus,
+ *	switches PE5 to AF3, reset TIM9 counter, clear capture flags,
+ *	enable TIM9 capture interrupt, set internal state to WAIT_RESPONSE
+ *
+ * @param	none
+ * @return DHT22_START_OK if started, DHT22_START_BUSY if busy.
+ */
+dht22_start_status_t dht22_start_read(void);
+
+/**
+ * @brief  DHT22 TIM9 input capture ISR handler.
+ *
+ * @param	none
+ * @return 	none
+ */
+void dht22_tim9_isr(void);
+
+/**
+ * @brief  Get the result of the last DHT22 measurement.
+ * @param[out] temperature  Pointer to store temperature (°C).
+ * @param[out] humidity     Pointer to store humidity (%RH).
+ * @return dht22_status_t   Status code.
+ */
+dht22_status_t dht22_get_result(float *temperature, float *humidity);
+
+/**
+ * @brief  Convert DHT22 status code to human-readable string.
+ * @param[in] status    Status code.
+ * @return const char*  Static string.
  */
 const char* dht22_status_to_str(dht22_status_t status);
 
