@@ -1,86 +1,111 @@
 # stm32-dht22-input-capture
 
-STM32F446ZE firmware project demonstrating two implementations of the DHT22 (AM2302) single-wire protocol:
-- **v1.0**: GPIO-driven “bit-banging” using a **free-running 1 MHz timer** for microsecond timing
-- **v2.0**: Hardware-assisted decoding using **TIM9 Input Capture** (edge timestamping) with an ISR-driven FSM
+This project implements a temperature and humidity measurement system using a **DHT22 (AM2302)** sensor and an **STM32F446ZE** microcontroller.
+
+It demonstrates two different approaches to decoding the DHT22 single-wire protocol:
+
+- **v1.0** – GPIO bit-banging using a free-running 1 MHz timer for microsecond timing  
+- **v2.0** – Hardware-assisted decoding using **TIM9 Input Capture** with an interrupt-driven finite state machine (FSM)
 
 ---
 
 ## Features
 
-- Periodic measurement scheduling using **TIM6** (5 s interval)
-- DHT22 protocol handling using:
-  - **v1.0**: polling + microsecond timebase (TIM9 free-running counter)
-  - **v2.0**: **TIM9 input capture** with polarity toggling and an interrupt-driven finite state machine
+- Periodic sensor sampling every 5 s using **TIM6**
+- Two DHT22 driver implementations:
+  - **v1.0**: **Bit-banging** with a free-running microsecond counter
+  - **v2.0**: **Input capture** with deterministic edge timestamping
+- ISR-driven finite state machine for protocol decoding
 - UART output over **USART3** (ST-Link Virtual COM Port)
+- Register-level peripheral configuration (no HAL timing helpers)
 
 ---
 
 ## Hardware / Board
 
-- MCU: **STM32F446ZE** (NUCLEO-F446ZE)
-- Sensor: **DHT22 (AM2302)**
+- **MCU / Board:** STM32F446ZE (NUCLEO-F446ZE)
+- **Sensor:** DHT22 / AM2302
+- **Pull-up resistor:** Required on the DHT22 data line (single-wire bus)
+- **Host PC:** Serial terminal for UART output
 
 ### Pin mapping
-- **PE5**: DHT22 data line (bidirectional single-wire)
-- **USART3**: UART log/output  
-  - PD8: TX  
-  - PD9: RX
 
-> Note: DHT22 data line should be used with a pull-up resistor (typical single-wire / open-drain behavior).
-
-
-### Timer configuration
-- **TIM6**: periodic trigger (5 s)
-- **TIM9**: protocol timing (v1: timebase, v2: input capture)
+| Signal | MCU Pin | Peripheral |
+|------|--------|-----------|
+| DHT22 Data | PE5 | GPIO / TIM9_CH1 (AF3) |
+| Periodic Trigger | — | TIM6 |
+| Protocol Timing | — | TIM9 |
+| UART TX | PD8 | USART3 |
+| UART RX | PD9 | USART3 |
 
 ---
 
-## Architecture (v2.0 input capture)
+## Firmware Architecture
 
-### Design goals
-- Deterministic pulse measurement (microsecond resolution)
-- Minimal CPU load (no busy-loop edge timing)
-- Clear separation of responsibilities:
-  - **main.c**: scheduling and reporting
-  - **dht22.c/.h**: sensor driver and protocol decode
-  - **clock.c/.h**: clock-query helpers for correct prescaler/baud calculations
+### Design Goals
+- Accurate microsecond-level timing
+- Deterministic protocol decoding
+- Minimal CPU load during measurements
+- Clear separation between application logic and sensor driver
 
-### High-level flow
-1. **TIM6 interrupt** sets a request flag every 5 s
-2. `main()` calls `dht22_start_read()` when requested
-3. Start phase:
-   - PE5 configured as GPIO output, drives low (~1 ms)
-   - PE5 switched to AF3 for TIM9 input capture
-4. **TIM9 ISR** timestamps edges and reconstructs the 40-bit frame
-5. `main()` validates checksum, decodes to °C / %RH, prints over UART
+---
+
+1. **TIM6 interrupt** triggers a sensor read request every 5 seconds  
+2. `main()` initiates the read via `dht22_start_read()`  
+3. The MCU drives the DHT22 data line low (~1 ms start pulse)  
+4. PE5 is switched to **TIM9 input capture (AF3)**  
+5. **TIM9 ISR** timestamps rising and falling edges and reconstructs the 40-bit frame  
+6. The application validates checksum, converts values, and outputs results via UART  
+
+---
+
+### Version Comparison
+
+#### v1.0 – Bit-Banging (Free-Running Timer)
+- TIM9 used as a 1 MHz free-running counter
+- GPIO polling with busy-wait loops
+- Simple and functional
+- Higher CPU load and sensitive to interrupt jitter
+
+#### v2.0 – Input Capture (Current Version)
+- TIM9 input capture timestamps signal edges in hardware
+- ISR-driven finite state machine
+- Deterministic timing and improved robustness
+- Scalable design suitable for multitasking systems
 
 ---
 
 ## Releases / Milestones
 
-- **v1.0-bitbang** – Bit-banging with free-running 1 MHz timer  
-- **v2.0-input-capture** – TIM9 Input Capture (recommended “current” version)
+- **v1.0-bitbang**  
+  Initial working implementation using GPIO bit-banging and a free-running timer.
 
-See the **Releases** page for tagged milestones and notes.
+- **v2.0-input-capture** *(latest)*  
+  Hardware-assisted DHT22 driver using TIM9 input capture and FSM-based decoding.
+
+See the **Releases** section for tagged versions and detailed notes.
 
 ---
 
 ## Build & Run
 
 1. Open the project in **STM32CubeIDE**
-2. Build (Debug or Release)
-3. Flash to the NUCLEO board
+2. Build (Debug or Release configuration)
+3. Flash to the NUCLEO-F446ZE board
 4. Open a serial terminal:
-   - Baud: **115200**
-   - 8N1
+   - **Baud rate:** 115200
+   - **Format:** 8-N-1
+
+Measured temperature and humidity values will be printed periodically.
 
 ---
 
-## What this project demonstrates
+## What This Project Demonstrates
 
-- STM32 timer fundamentals: prescaler, counter, capture/compare, interrupts
-- ISR design: short deterministic handlers + FSM approach
-- Protocol decoding from pulse widths
-- Practical driver layering and error reporting
+- STM32 general-purpose timer usage
+- Input capture configuration and polarity control
+- Interrupt-driven finite state machine design
+- Timing-critical single-wire protocol decoding
+- Clean driver/API separation in embedded C
+- Incremental design improvement and refactoring
 
