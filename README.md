@@ -87,6 +87,19 @@ See the **Releases** section for tagged versions and detailed notes.
 
 ---
 
+## Evidence / Measurements
+
+### Hardware setup
+![Hardware setup](docs/images/setup.jpg)
+
+### UART output (RealTerm)
+![UART output](docs/images/serial-realterm.png)
+
+### DHT22 waveform (Analog Discovery 3)
+![Analog Discovery capture](docs/images/analog-discovery-capture.png)
+
+---
+
 ## Build & Run
 
 1. Open the project in **STM32CubeIDE**
@@ -108,4 +121,5 @@ Measured temperature and humidity values will be printed periodically.
 - Timing-critical single-wire protocol decoding
 - Clean driver/API separation in embedded C
 - Incremental design improvement and refactoring
+
 
